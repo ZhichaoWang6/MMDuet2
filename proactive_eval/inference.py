@@ -13,6 +13,11 @@ from qwen_vl_utils import process_vision_info
 from qwen2_5_vl import Qwen2_5_VLForConditionalGeneration
 import logging
 
+import sys
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+from kangaroo.kangaroo_model import KangarooQwenModel
+from kangaroo.inference_kangaroo import speculative_generate_for_streaming
+
 logger = transformers.logging.get_logger('inference')
 logger.setLevel(logging.INFO)
 
@@ -34,6 +39,14 @@ class ProactiveTestArguments(TrainingArguments):
     temperature: float = 1.0
     top_k: int = 40
 
+    # speculative decoding arguments
+    use_speculative_decoding: bool = False
+    adapter_path: str = None
+    exit_layer: int = 2
+    speculative_threshold: float = 0.6
+    speculative_steps: int = 6
+    num_adapter_layers: int = 1
+
 
 def get_args():
     args, = HfArgumentParser(ProactiveTestArguments).parse_args_into_dataclasses()
@@ -44,10 +57,28 @@ def get_args():
 class ProactiveInferenceClient:
     def __init__(self, args=None, model=None, processor=None) -> None:
         self.args = args
-        
-        self.model = model if model is not None else Qwen2_5_VLForConditionalGeneration.from_pretrained(
-            args.llm_pretrained, torch_dtype=torch.bfloat16, attn_implementation=args.attn_implementation,
-        ).eval().to('cuda:0')
+        self.use_speculative_decoding = getattr(args, 'use_speculative_decoding', False)
+
+        if self.use_speculative_decoding and model is None:
+            logger.info("Loading model with speculative decoding (Kangaroo adapter)")
+            self.kangaroo_model = KangarooQwenModel(
+                base_model_path=args.llm_pretrained,
+                adapter_model_path=args.adapter_path,
+                early_exit_layer=args.exit_layer,
+                dtype=torch.bfloat16,
+                attn_implementation=args.attn_implementation,
+                num_adapter_layers=args.num_adapter_layers,
+            ).to('cuda:0')
+            self.model = self.kangaroo_model.base_model.model  # raw Qwen2.5-VL model for compatibility
+            self.speculative_threshold = args.speculative_threshold
+            self.speculative_steps = args.speculative_steps
+            self.exit_layer = args.exit_layer
+        else:
+            self.kangaroo_model = None
+            self.model = model if model is not None else Qwen2_5_VLForConditionalGeneration.from_pretrained(
+                args.llm_pretrained, torch_dtype=torch.bfloat16, attn_implementation=args.attn_implementation,
+            ).eval().to('cuda:0')
+
         self.processor = processor if processor is not None else AutoProcessor.from_pretrained(
             args.llm_pretrained
         )
@@ -93,6 +124,8 @@ class ProactiveInferenceClient:
         self.all_keep_masks = list()
         if hasattr(self.model, 'reset_status'):
             self.model.reset_status()
+        if self.kangaroo_model is not None:
+            self.kangaroo_model.reset_status()
 
     def input_query_stream(self, conversation):
         if conversation[0]['role'] != 'system':
@@ -174,20 +207,37 @@ class ProactiveInferenceClient:
             inputs['input_ids'] = inputs.input_ids[keep_mask].unsqueeze(0)
             inputs['attention_mask'] = inputs.attention_mask[keep_mask].unsqueeze(0)
 
-        model_output = self.model.generate(
-            **inputs,
-            max_new_tokens=512,
-            past_key_values=self.past_key_values,
-            return_dict_in_generate=True,
-            drop_method='none', drop_threshold=1.0, drop_absolute=True,      # no dropping
-            # The following parameters are if we want to sample more diverse answers. After testing, it was found that this sampling indeed greatly reduces the probability of the model remaining silent and also increases the diversity of replies.
-            do_sample=self.do_sample, temperature=self.temperature, top_k=self.top_k
-        )
+        if self.use_speculative_decoding and self.kangaroo_model is not None:
+            # Use Kangaroo speculative decoding
+            reply_text, self.past_key_values, spec_stats = speculative_generate_for_streaming(
+                model=self.kangaroo_model,
+                inputs=inputs,
+                processor=self.processor,
+                past_key_values=self.past_key_values,
+                max_new_tokens=512,
+                early_exit_layer=self.exit_layer,
+                speculative_steps=self.speculative_steps,
+                threshold=self.speculative_threshold,
+            )
+            if debug_print:
+                print(f"Speculative decoding stats: avg_accept={spec_stats['avg_accept_length']:.2f}, "
+                      f"rounds={spec_stats['total_rounds']}, tokens={spec_stats['total_tokens']}")
+        else:
+            # Standard autoregressive generation
+            model_output = self.model.generate(
+                **inputs,
+                max_new_tokens=512,
+                past_key_values=self.past_key_values,
+                return_dict_in_generate=True,
+                drop_method='none', drop_threshold=1.0, drop_absolute=True,      # no dropping
+                # The following parameters are if we want to sample more diverse answers. After testing, it was found that this sampling indeed greatly reduces the probability of the model remaining silent and also increases the diversity of replies.
+                do_sample=self.do_sample, temperature=self.temperature, top_k=self.top_k
+            )
 
-        self.past_key_values = model_output.past_key_values
-        output_token_ids = model_output.sequences
-        output_token_ids = output_token_ids[:, inputs.input_ids.size(1):]
-        reply_text = self.processor.batch_decode(output_token_ids, skip_special_tokens=True)[0]
+            self.past_key_values = model_output.past_key_values
+            output_token_ids = model_output.sequences
+            output_token_ids = output_token_ids[:, inputs.input_ids.size(1):]
+            reply_text = self.processor.batch_decode(output_token_ids, skip_special_tokens=True)[0]
         if query.get('must_reply', False):
             reply_text = self.must_reply_prompt + reply_text
         self.history.append({'role': 'assistant', 'content': reply_text, 'time': self.video_time})

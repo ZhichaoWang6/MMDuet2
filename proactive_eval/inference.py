@@ -220,8 +220,15 @@ class ProactiveInferenceClient:
                 threshold=self.speculative_threshold,
             )
             if debug_print:
-                print(f"Speculative decoding stats: avg_accept={spec_stats['avg_accept_length']:.2f}, "
-                      f"rounds={spec_stats['total_rounds']}, tokens={spec_stats['total_tokens']}")
+                print(f"Speculative decoding stats: "
+                      f"avg_accept={spec_stats['avg_accept_length']:.2f}, "
+                      f"rounds={spec_stats['total_rounds']}, "
+                      f"tokens={spec_stats['total_tokens']}, "
+                      f"tok/s={spec_stats['tokens_per_second']:.1f}, "
+                      f"decode_tok/s={spec_stats['decode_tokens_per_second']:.1f}, "
+                      f"prefill={spec_stats['prefill_time']:.3f}s, "
+                      f"decode={spec_stats['decode_time']:.3f}s, "
+                      f"total={spec_stats['total_time']:.3f}s")
         else:
             # Standard autoregressive generation
             model_output = self.model.generate(

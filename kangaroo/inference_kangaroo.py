@@ -10,9 +10,37 @@ This replaces model.generate() with a custom draft-verify loop:
 Adapted from Kangaroo's inference_kangaroo.py for Qwen2.5-VL.
 """
 
+import time
+
 import torch
 from typing import Optional, Tuple, List
 from transformers.cache_utils import DynamicCache
+
+
+def _build_stats(accept_length_list, prefill_time, draft_times, verify_times, total_time, num_new_tokens):
+    """Build comprehensive timing and acceptance statistics."""
+    decode_time = total_time - prefill_time
+    avg_accept = sum(accept_length_list) / len(accept_length_list) if accept_length_list else 0
+    tokens_per_second = num_new_tokens / total_time if total_time > 0 else 0
+    decode_tokens_per_second = num_new_tokens / decode_time if decode_time > 0 else 0
+    return {
+        # Acceptance metrics
+        'accept_lengths': accept_length_list,
+        'avg_accept_length': avg_accept,
+        'total_rounds': len(accept_length_list),
+        'total_tokens': num_new_tokens,
+        # Timing metrics (seconds)
+        'total_time': total_time,
+        'prefill_time': prefill_time,
+        'decode_time': decode_time,
+        'draft_times': draft_times,
+        'verify_times': verify_times,
+        'avg_draft_time': sum(draft_times) / len(draft_times) if draft_times else 0,
+        'avg_verify_time': sum(verify_times) / len(verify_times) if verify_times else 0,
+        # Speed metrics
+        'tokens_per_second': tokens_per_second,
+        'decode_tokens_per_second': decode_tokens_per_second,
+    }
 
 
 @torch.no_grad()
@@ -44,9 +72,13 @@ def kangaroo_speculative_generate(
     Returns:
         output_ids: Generated token IDs (input + generated)
         past_key_values: Updated KV cache
-        accept_length_list: List of accepted lengths per round (for benchmarking)
+        stats: Dict with timing and acceptance metrics
     """
     assert not do_sample, "Only greedy decoding is supported for speculative decoding"
+
+    # Timing
+    torch.cuda.synchronize() if torch.cuda.is_available() else None
+    t_start = time.perf_counter()
 
     base_model = model.base_model
     adapter_model = model.adapter_model
@@ -75,6 +107,8 @@ def kangaroo_speculative_generate(
     start_index = context_length
 
     # ========== STEP 0: Prefill with full model ==========
+    torch.cuda.synchronize() if torch.cuda.is_available() else None
+    t_prefill_start = time.perf_counter()
     # Build forward kwargs for the full model
     forward_kwargs = {
         'input_ids': inputs['input_ids'],
@@ -117,10 +151,21 @@ def kangaroo_speculative_generate(
         use_cache=True,
     )
 
+    torch.cuda.synchronize() if torch.cuda.is_available() else None
+    t_prefill_end = time.perf_counter()
+    prefill_time = t_prefill_end - t_prefill_start
+
+    # Per-round timing
+    draft_times = []
+    verify_times = []
+
     # Check if first token is EOS
     if first_token.item() in token_eos_set:
         output_ids = global_tokens[:, :start_index + 1]
-        return output_ids, base_model.past_key_values, accept_length_list
+        torch.cuda.synchronize() if torch.cuda.is_available() else None
+        total_time = time.perf_counter() - t_start
+        stats = _build_stats([1], prefill_time, [], [], total_time, 1)
+        return output_ids, base_model.past_key_values, stats
 
     # ========== STEP 1-4: Draft-Verify Loop ==========
     max_infer_steps = min(max_length, start_index + max_new_tokens)
@@ -131,6 +176,8 @@ def kangaroo_speculative_generate(
         end_index = start_index + 1
 
         # ---- STEP 1: Draft token generation with early layers + adapter ----
+        torch.cuda.synchronize() if torch.cuda.is_available() else None
+        t_draft_start = time.perf_counter()
         exited_hidden_states = None
 
         for step in range(1 + speculative_steps):
@@ -181,6 +228,12 @@ def kangaroo_speculative_generate(
             predict_score = predict_logits.softmax(dim=-1).max().item()
 
         # ---- STEP 2: Verify with remaining layers ----
+        torch.cuda.synchronize() if torch.cuda.is_available() else None
+        t_draft_end = time.perf_counter()
+        draft_times.append(t_draft_end - t_draft_start)
+
+        torch.cuda.synchronize() if torch.cuda.is_available() else None
+        t_verify_start = time.perf_counter()
         verify_cache_len = base_model._get_layer_cache_length(early_exit_layer)
         assert verify_cache_len == start_index, \
             f"Verify cache mismatch: {verify_cache_len} != {start_index}"
@@ -207,6 +260,9 @@ def kangaroo_speculative_generate(
                 if is_eos:
                     stop = True
                 break
+
+        torch.cuda.synchronize() if torch.cuda.is_available() else None
+        verify_times.append(time.perf_counter() - t_verify_start)
 
         accept_length_list.append(start_index - start_index_copy)
 
@@ -236,7 +292,11 @@ def kangaroo_speculative_generate(
 
     # Trim output
     output_ids = global_tokens[:, :start_index + 1]
-    return output_ids, base_model.past_key_values, accept_length_list
+    num_new_tokens = start_index + 1 - context_length
+    torch.cuda.synchronize() if torch.cuda.is_available() else None
+    total_time = time.perf_counter() - t_start
+    stats = _build_stats(accept_length_list, prefill_time, draft_times, verify_times, total_time, num_new_tokens)
+    return output_ids, base_model.past_key_values, stats
 
 
 def speculative_generate_for_streaming(
@@ -253,7 +313,7 @@ def speculative_generate_for_streaming(
     Wrapper for speculative decoding in the streaming proactive_eval setting.
     Returns the generated text and updated KV cache.
     """
-    output_ids, past_key_values, accept_lengths = kangaroo_speculative_generate(
+    output_ids, past_key_values, stats = kangaroo_speculative_generate(
         model=model,
         inputs=inputs,
         processor=processor,
@@ -271,13 +331,5 @@ def speculative_generate_for_streaming(
 
     tokenizer = processor.tokenizer if hasattr(processor, 'tokenizer') else processor
     reply_text = tokenizer.batch_decode(new_token_ids, skip_special_tokens=True)[0]
-
-    avg_accept = sum(accept_lengths) / len(accept_lengths) if accept_lengths else 0
-    stats = {
-        'accept_lengths': accept_lengths,
-        'avg_accept_length': avg_accept,
-        'total_rounds': len(accept_lengths),
-        'total_tokens': new_token_ids.shape[1],
-    }
 
     return reply_text, past_key_values, stats

@@ -84,36 +84,35 @@ class EarlyExitQwen2_5_VLForConditionalGeneration:
             hidden_states = in_features_large
             layers = qwen_model.layers[self.early_exit_layer:]
 
-        # Compute position embeddings (mRoPE)
-        if position_ids is None:
-            past_length = self.past_key_values.get_seq_length()
-            cache_position_local = torch.arange(
-                past_length, past_length + seq_length,
+        # Determine the correct past_length based on which layers we're running
+        # IMPORTANT: Cannot use get_seq_length() (_seen_tokens) because draft layers
+        # increment it, making it wrong for verify layers. Use per-layer cache length.
+        if in_tokens_small is not None:
+            focu_layer = 0  # Draft layers use cache length at layer 0
+        else:
+            focu_layer = self.early_exit_layer  # Verify layers use cache length at exit layer
+        layer_past_length = self._get_layer_cache_length(focu_layer)
+
+        # Compute cache_position (where to write in KV cache)
+        if cache_position is None:
+            cache_position = torch.arange(
+                layer_past_length, layer_past_length + seq_length,
                 device=hidden_states.device,
             )
+
+        # Compute position embeddings (mRoPE)
+        if position_ids is None:
             # For text-only decode tokens, all 3 dims of mRoPE use the same value
             rope_deltas = self.model.rope_deltas
             if rope_deltas is not None:
-                delta = (cache_position_local[0] + rope_deltas).to(hidden_states.device)
+                delta = (layer_past_length + rope_deltas).to(hidden_states.device)
             else:
-                delta = 0
+                delta = layer_past_length
             position_ids = torch.arange(seq_length, device=hidden_states.device)
             position_ids = position_ids.view(1, -1).expand(batch_size, -1) + delta
             position_ids = position_ids.unsqueeze(0).expand(3, -1, -1)
         elif position_ids.dim() == 2:
             position_ids = position_ids.unsqueeze(0).expand(3, -1, -1)
-
-        if cache_position is None:
-            if in_tokens_small is not None:
-                # Draft layers use the KV cache length at layer 0
-                focu_layer = 0
-            else:
-                focu_layer = self.early_exit_layer
-            past_length = self._get_layer_cache_length(focu_layer)
-            cache_position = torch.arange(
-                past_length, past_length + seq_length,
-                device=hidden_states.device,
-            )
 
         # Compute rotary embeddings
         position_embeddings = qwen_model.rotary_emb(hidden_states, position_ids)

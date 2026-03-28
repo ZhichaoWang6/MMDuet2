@@ -14,7 +14,7 @@ from model import Qwen2_5_VLForConditionalGeneration
 import logging
 
 from kangaroo_model import KangarooQwenModel
-from inference_kangaroo import speculative_generate_for_streaming
+from inference_kangaroo import speculative_generate_for_streaming, ar_generate_for_streaming
 
 logger = transformers.logging.get_logger('inference')
 logger.setLevel(logging.INFO)
@@ -234,47 +234,26 @@ class ProactiveInferenceClient:
 
             # ---- Also run autoregressive baseline for comparison ----
             if self.compare_with_baseline:
-                # Need to reset kangaroo model state before AR run since it shares the underlying model
-                self.kangaroo_model.base_model.past_key_values = self.past_key_values_ar
-
-                torch.cuda.synchronize() if torch.cuda.is_available() else None
-                t_start = time.perf_counter()
-
-                model_output = self.model.generate(
-                    **inputs,
-                    max_new_tokens=512,
+                ar_text, self.past_key_values_ar, ar_stats = ar_generate_for_streaming(
+                    model=self.kangaroo_model,
+                    inputs=inputs,
+                    processor=self.processor,
                     past_key_values=self.past_key_values_ar,
-                    return_dict_in_generate=True,
-                    drop_method='none', drop_threshold=1.0, drop_absolute=True,
-                    do_sample=False, temperature=1.0,
+                    max_new_tokens=512,
                 )
-
-                torch.cuda.synchronize() if torch.cuda.is_available() else None
-                ar_time = time.perf_counter() - t_start
-
-                self.past_key_values_ar = model_output.past_key_values
-                ar_token_ids = model_output.sequences[:, inputs.input_ids.size(1):]
-                ar_num_tokens = ar_token_ids.shape[1]
-                ar_text = self.processor.batch_decode(ar_token_ids, skip_special_tokens=True)[0]
-
-                ar_stats = {
-                    'total_tokens': ar_num_tokens,
-                    'total_time': ar_time,
-                    'tokens_per_second': ar_num_tokens / ar_time if ar_time > 0 else 0,
-                }
                 combined_stats['autoregressive'] = ar_stats
 
                 # Compare outputs
                 spec_tokens = spec_stats['total_tokens']
                 match = (reply_text == ar_text)
-                speedup = ar_time / spec_stats['total_time'] if spec_stats['total_time'] > 0 else 0
+                speedup = ar_stats['total_time'] / spec_stats['total_time'] if spec_stats['total_time'] > 0 else 0
                 combined_stats['output_match'] = match
                 combined_stats['speedup_ratio'] = speedup
 
                 if debug_print or not match:
                     tag = "MATCH" if match else "MISMATCH"
-                    print(f"[AR Baseline] tokens={ar_num_tokens}, tok/s={ar_stats['tokens_per_second']:.1f}, time={ar_time:.3f}s")
-                    print(f"[Compare] [{tag}] spec_tokens={spec_tokens}, ar_tokens={ar_num_tokens}, speedup={speedup:.2f}x")
+                    print(f"[AR Baseline] tokens={ar_stats['total_tokens']}, tok/s={ar_stats['tokens_per_second']:.1f}, time={ar_stats['total_time']:.3f}s")
+                    print(f"[Compare] [{tag}] spec_tokens={spec_tokens}, ar_tokens={ar_stats['total_tokens']}, speedup={speedup:.2f}x")
                     if not match:
                         print(f"  Spec output: {repr(reply_text[:200])}")
                         print(f"  AR   output: {repr(ar_text[:200])}")

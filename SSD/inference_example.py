@@ -15,7 +15,7 @@ import torch
 from transformers import AutoProcessor
 
 from kangaroo_model import KangarooQwenModel
-from inference_kangaroo import kangaroo_speculative_generate
+from inference_kangaroo import kangaroo_speculative_generate, autoregressive_generate_direct
 
 
 def main():
@@ -57,7 +57,6 @@ def main():
         early_exit_layer=args.exit_layer,
         speculative_steps=args.speculative_steps,
         threshold=args.threshold,
-        debug_verify=True,
     )
 
     # Decode speculative output
@@ -65,31 +64,22 @@ def main():
     spec_reply = processor.batch_decode(spec_new_tokens, skip_special_tokens=True)[0]
     spec_num_tokens = spec_new_tokens.shape[1]
 
-    # ========== 2. Run autoregressive baseline ==========
-    print("Generating with autoregressive decoding (baseline)...")
+    # ========== 2. Run autoregressive baseline (direct forward, same path as speculative) ==========
+    print("Generating with autoregressive decoding (direct forward baseline)...")
 
     # Reset model state for clean AR run
     model.base_model.past_key_values = None
     model.reset_status()
     model.base_model.model.rope_deltas = None  # force recompute
 
-    torch.cuda.synchronize() if torch.cuda.is_available() else None
-    t_start = time.perf_counter()
-
-    ar_output = model.base_model.model.generate(
-        **inputs,
+    ar_reply, _, ar_stats = autoregressive_generate_direct(
+        model=model,
+        inputs=inputs,
+        processor=processor,
         max_new_tokens=args.max_new_tokens,
-        return_dict_in_generate=True,
-        do_sample=False,
-        drop_method='none', drop_threshold=1.0, drop_absolute=True,
     )
-
-    torch.cuda.synchronize() if torch.cuda.is_available() else None
-    ar_time = time.perf_counter() - t_start
-
-    ar_token_ids = ar_output.sequences[:, inputs['input_ids'].shape[1]:]
-    ar_num_tokens = ar_token_ids.shape[1]
-    ar_reply = processor.batch_decode(ar_token_ids, skip_special_tokens=True)[0]
+    ar_num_tokens = ar_stats['total_tokens']
+    ar_time = ar_stats['total_time']
 
     # ========== 3. Compare and print results ==========
     output_match = (spec_reply == ar_reply)
@@ -111,12 +101,11 @@ def main():
     print(f"  Avg verify time:   {stats['avg_verify_time']*1000:.1f}ms")
     print(f"  Accept lengths:    {stats['accept_lengths']}")
 
-    ar_tok_s = ar_num_tokens / ar_time if ar_time > 0 else 0
-    print(f"\n[Autoregressive Baseline]")
+    print(f"\n[Autoregressive Baseline (direct forward)]")
     print(f"  Reply:  {ar_reply}")
     print(f"  Tokens: {ar_num_tokens}")
-    print(f"  Time:   {ar_time:.3f}s")
-    print(f"  Tok/s:  {ar_tok_s:.1f}")
+    print(f"  Time:   {ar_time:.3f}s (prefill={ar_stats['prefill_time']:.3f}s, decode={ar_stats['decode_time']:.3f}s)")
+    print(f"  Tok/s:  {ar_stats['tokens_per_second']:.1f} (decode: {ar_stats['decode_tokens_per_second']:.1f})")
 
     print(f"\n[Comparison]")
     print(f"  Speedup:       {speedup:.2f}x")

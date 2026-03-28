@@ -354,3 +354,129 @@ def speculative_generate_for_streaming(
     reply_text = tokenizer.batch_decode(new_token_ids, skip_special_tokens=True)[0]
 
     return reply_text, past_key_values, stats
+
+
+@torch.no_grad()
+def autoregressive_generate_direct(
+    model,  # KangarooQwenModel (uses base_model.model for full forward)
+    inputs,  # Processor output
+    processor,
+    max_new_tokens: int = 512,
+    past_key_values=None,
+):
+    """
+    Direct autoregressive generation using token-by-token forward (no generate()).
+    Uses the same forward path as speculative decoding for fair comparison.
+    Returns (reply_text, past_key_values, stats).
+    """
+    torch.cuda.synchronize() if torch.cuda.is_available() else None
+    t_start = time.perf_counter()
+
+    full_model = model.base_model.model  # Qwen2_5_VLForConditionalGeneration
+    qwen_model = full_model.model        # Qwen2_5_VLModel
+    lm_head = model.head_model
+    device = inputs['input_ids'].device
+
+    tokenizer = processor.tokenizer if hasattr(processor, 'tokenizer') else processor
+    token_eos = tokenizer.eos_token_id
+    if isinstance(token_eos, list):
+        token_eos_set = set(token_eos)
+    else:
+        token_eos_set = {token_eos}
+
+    input_ids = inputs['input_ids']
+    batch_size, context_length = input_ids.shape
+
+    # ---- Prefill ----
+    forward_kwargs = {
+        'input_ids': inputs['input_ids'],
+        'attention_mask': inputs.get('attention_mask'),
+        'use_cache': True,
+        'return_dict': True,
+        'past_key_values': past_key_values,
+        'pixel_values': inputs.get('pixel_values'),
+        'pixel_values_videos': inputs.get('pixel_values_videos'),
+        'image_grid_thw': inputs.get('image_grid_thw'),
+        'video_grid_thw': inputs.get('video_grid_thw'),
+        'second_per_grid_ts': inputs.get('second_per_grid_ts'),
+        'drop_method': 'none', 'drop_threshold': 1.0, 'drop_absolute': True,
+    }
+    forward_kwargs = {k: v for k, v in forward_kwargs.items() if v is not None}
+
+    output = full_model(**forward_kwargs)
+    kv_cache = output.past_key_values
+    rope_deltas = full_model.rope_deltas
+
+    logits = output.logits[:, -1, :]
+    next_token = torch.argmax(logits, dim=-1).item()
+
+    torch.cuda.synchronize() if torch.cuda.is_available() else None
+    prefill_time = time.perf_counter() - t_start
+
+    generated_tokens = [next_token]
+
+    # ---- Token-by-token decode through ALL layers ----
+    for step in range(max_new_tokens - 1):
+        if next_token in token_eos_set:
+            break
+
+        in_token = torch.tensor([[next_token]], device=device)
+        pos = kv_cache.key_cache[0].shape[2]  # current cache length = next position
+        cache_pos = torch.tensor([pos], device=device)
+
+        if rope_deltas is not None:
+            delta = (pos + rope_deltas).to(device)
+        else:
+            delta = pos
+        pos_ids = (torch.zeros(1, 1, device=device, dtype=torch.long) + delta)
+        pos_ids = pos_ids.unsqueeze(0).expand(3, -1, -1)
+
+        h = qwen_model.embed_tokens(in_token)
+        pe = qwen_model.rotary_emb(h, pos_ids)
+        attn_mask = torch.ones((1, pos + 1), dtype=torch.bool, device=device)
+        cm = qwen_model._update_causal_mask(attn_mask, h, cache_pos, kv_cache, False)
+
+        for layer in qwen_model.layers:
+            lo = layer(h, attention_mask=cm, position_ids=pos_ids,
+                       past_key_value=kv_cache, output_attentions=False,
+                       use_cache=True, cache_position=cache_pos,
+                       position_embeddings=pe)
+            h = lo[0]
+
+        h = qwen_model.norm(h)
+        logits = lm_head(h).float()
+        next_token = torch.argmax(logits[:, -1, :], dim=-1).item()
+        generated_tokens.append(next_token)
+
+    torch.cuda.synchronize() if torch.cuda.is_available() else None
+    total_time = time.perf_counter() - t_start
+    num_tokens = len(generated_tokens)
+
+    reply_text = tokenizer.decode(generated_tokens, skip_special_tokens=True)
+    stats = {
+        'total_tokens': num_tokens,
+        'total_time': total_time,
+        'prefill_time': prefill_time,
+        'decode_time': total_time - prefill_time,
+        'tokens_per_second': num_tokens / total_time if total_time > 0 else 0,
+        'decode_tokens_per_second': num_tokens / (total_time - prefill_time) if (total_time - prefill_time) > 0 else 0,
+    }
+    return reply_text, kv_cache, stats
+
+
+def ar_generate_for_streaming(
+    model,  # KangarooQwenModel
+    inputs,
+    processor,
+    past_key_values=None,
+    max_new_tokens: int = 512,
+):
+    """Wrapper for direct AR generation in streaming setting."""
+    reply_text, past_key_values, stats = autoregressive_generate_direct(
+        model=model,
+        inputs=inputs,
+        processor=processor,
+        max_new_tokens=max_new_tokens,
+        past_key_values=past_key_values,
+    )
+    return reply_text, past_key_values, stats

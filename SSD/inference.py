@@ -1,4 +1,4 @@
-import collections, math, json, copy, re, os
+import collections, math, json, copy, re, os, time
 from dataclasses import asdict, dataclass, field
 from tqdm import tqdm
 from PIL import Image
@@ -39,6 +39,7 @@ class ProactiveTestArguments(TrainingArguments):
 
     # speculative decoding arguments
     use_speculative_decoding: bool = False
+    compare_with_baseline: bool = False  # Run both AR and speculative, compare outputs & speed
     adapter_path: str = None
     exit_layer: int = 2
     speculative_threshold: float = 0.6
@@ -56,6 +57,7 @@ class ProactiveInferenceClient:
     def __init__(self, args=None, model=None, processor=None) -> None:
         self.args = args
         self.use_speculative_decoding = getattr(args, 'use_speculative_decoding', False)
+        self.compare_with_baseline = getattr(args, 'compare_with_baseline', False)
 
         if self.use_speculative_decoding and model is None:
             logger.info("Loading model with speculative decoding (Kangaroo adapter)")
@@ -95,6 +97,8 @@ class ProactiveInferenceClient:
         self.prev_image_inputs = list()
         self.prev_video_inputs = list()
         self.all_keep_masks = list()
+        # Generation speed tracking
+        self.generation_stats = []
         self.reset()
 
     def set_fps(self, fps=None, frame_interval=None):
@@ -114,12 +118,14 @@ class ProactiveInferenceClient:
         self.frame_idx = 0
         self.video_tensor = None
         self.past_key_values = None
+        self.past_key_values_ar = None  # Separate KV cache for AR baseline comparison
         self.history = list()
         self.prev_frame_before_token_drop = None
 
         self.prev_image_inputs = list()
         self.prev_video_inputs = list()
         self.all_keep_masks = list()
+        self.generation_stats = []
         if hasattr(self.model, 'reset_status'):
             self.model.reset_status()
         if self.kangaroo_model is not None:
@@ -206,7 +212,7 @@ class ProactiveInferenceClient:
             inputs['attention_mask'] = inputs.attention_mask[keep_mask].unsqueeze(0)
 
         if self.use_speculative_decoding and self.kangaroo_model is not None:
-            # Use Kangaroo speculative decoding
+            # ---- Run speculative decoding ----
             reply_text, self.past_key_values, spec_stats = speculative_generate_for_streaming(
                 model=self.kangaroo_model,
                 inputs=inputs,
@@ -217,32 +223,101 @@ class ProactiveInferenceClient:
                 speculative_steps=self.speculative_steps,
                 threshold=self.speculative_threshold,
             )
+
+            combined_stats = {'speculative': spec_stats}
             if debug_print:
-                print(f"Speculative decoding stats: "
-                      f"avg_accept={spec_stats['avg_accept_length']:.2f}, "
-                      f"rounds={spec_stats['total_rounds']}, "
-                      f"tokens={spec_stats['total_tokens']}, "
+                print(f"[Speculative] avg_accept={spec_stats['avg_accept_length']:.2f}, "
+                      f"rounds={spec_stats['total_rounds']}, tokens={spec_stats['total_tokens']}, "
                       f"tok/s={spec_stats['tokens_per_second']:.1f}, "
                       f"decode_tok/s={spec_stats['decode_tokens_per_second']:.1f}, "
-                      f"prefill={spec_stats['prefill_time']:.3f}s, "
-                      f"decode={spec_stats['decode_time']:.3f}s, "
                       f"total={spec_stats['total_time']:.3f}s")
+
+            # ---- Also run autoregressive baseline for comparison ----
+            if self.compare_with_baseline:
+                # Need to reset kangaroo model state before AR run since it shares the underlying model
+                self.kangaroo_model.base_model.past_key_values = self.past_key_values_ar
+
+                torch.cuda.synchronize() if torch.cuda.is_available() else None
+                t_start = time.perf_counter()
+
+                model_output = self.model.generate(
+                    **inputs,
+                    max_new_tokens=512,
+                    past_key_values=self.past_key_values_ar,
+                    return_dict_in_generate=True,
+                    drop_method='none', drop_threshold=1.0, drop_absolute=True,
+                    do_sample=False, temperature=1.0,
+                )
+
+                torch.cuda.synchronize() if torch.cuda.is_available() else None
+                ar_time = time.perf_counter() - t_start
+
+                self.past_key_values_ar = model_output.past_key_values
+                ar_token_ids = model_output.sequences[:, inputs.input_ids.size(1):]
+                ar_num_tokens = ar_token_ids.shape[1]
+                ar_text = self.processor.batch_decode(ar_token_ids, skip_special_tokens=True)[0]
+
+                ar_stats = {
+                    'total_tokens': ar_num_tokens,
+                    'total_time': ar_time,
+                    'tokens_per_second': ar_num_tokens / ar_time if ar_time > 0 else 0,
+                }
+                combined_stats['autoregressive'] = ar_stats
+
+                # Compare outputs
+                spec_tokens = spec_stats['total_tokens']
+                match = (reply_text == ar_text)
+                speedup = ar_time / spec_stats['total_time'] if spec_stats['total_time'] > 0 else 0
+                combined_stats['output_match'] = match
+                combined_stats['speedup_ratio'] = speedup
+
+                if debug_print or not match:
+                    tag = "MATCH" if match else "MISMATCH"
+                    print(f"[AR Baseline] tokens={ar_num_tokens}, tok/s={ar_stats['tokens_per_second']:.1f}, time={ar_time:.3f}s")
+                    print(f"[Compare] [{tag}] spec_tokens={spec_tokens}, ar_tokens={ar_num_tokens}, speedup={speedup:.2f}x")
+                    if not match:
+                        print(f"  Spec output: {repr(reply_text[:200])}")
+                        print(f"  AR   output: {repr(ar_text[:200])}")
+
+                # Restore kangaroo model state for next speculative turn
+                self.kangaroo_model.base_model.past_key_values = self.past_key_values
+
+            self.generation_stats.append(combined_stats)
         else:
             # Standard autoregressive generation
+            torch.cuda.synchronize() if torch.cuda.is_available() else None
+            t_start = time.perf_counter()
+
             model_output = self.model.generate(
                 **inputs,
                 max_new_tokens=512,
                 past_key_values=self.past_key_values,
                 return_dict_in_generate=True,
                 drop_method='none', drop_threshold=1.0, drop_absolute=True,      # no dropping
-                # The following parameters are if we want to sample more diverse answers. After testing, it was found that this sampling indeed greatly reduces the probability of the model remaining silent and also increases the diversity of replies.
                 do_sample=self.do_sample, temperature=self.temperature, top_k=self.top_k
             )
+
+            torch.cuda.synchronize() if torch.cuda.is_available() else None
+            gen_time = time.perf_counter() - t_start
 
             self.past_key_values = model_output.past_key_values
             output_token_ids = model_output.sequences
             output_token_ids = output_token_ids[:, inputs.input_ids.size(1):]
+            num_new_tokens = output_token_ids.shape[1]
             reply_text = self.processor.batch_decode(output_token_ids, skip_special_tokens=True)[0]
+
+            baseline_stats = {
+                'autoregressive': {
+                    'total_tokens': num_new_tokens,
+                    'total_time': gen_time,
+                    'tokens_per_second': num_new_tokens / gen_time if gen_time > 0 else 0,
+                },
+            }
+            self.generation_stats.append(baseline_stats)
+            if debug_print:
+                print(f"[AR] tokens={num_new_tokens}, "
+                      f"tok/s={baseline_stats['autoregressive']['tokens_per_second']:.1f}, "
+                      f"time={gen_time:.3f}s")
         if query.get('must_reply', False):
             reply_text = self.must_reply_prompt + reply_text
         self.history.append({'role': 'assistant', 'content': reply_text, 'time': self.video_time})
@@ -253,7 +328,11 @@ class ProactiveInferenceClient:
     def inference(self, debug_print=False):
         while self.query_queue:
             self._encode_query(debug_print=debug_print)
-        return {'conversation': copy.deepcopy(self.history), 'drop_ratio': copy.deepcopy(self.model.model.all_drop_ratios)}
+        return {
+            'conversation': copy.deepcopy(self.history),
+            'drop_ratio': copy.deepcopy(self.model.model.all_drop_ratios),
+            'generation_stats': copy.deepcopy(self.generation_stats),
+        }
 
 
 class DoNothingDataCollator:
@@ -335,11 +414,74 @@ def main():
             # 'model_response_list': [turn for turn in model_outputs['conversation'] if turn['role'] == 'assistant'],
             'model_response_list': post_process_conversation_for_print(model_outputs['conversation']),   # keep the user turns for easier human inspection of data quality
             'drop_ratio_list': model_outputs['drop_ratio'],
+            'generation_stats': model_outputs['generation_stats'],
         }
         f_out.write(json.dumps(res) + '\n')
         f_out.flush()
+
+        # Collect per-example speed stats
+        for s in model_outputs['generation_stats']:
+            all_stats.append(s)
+
     f_out.close()
+
+    # Print aggregate speed metrics
+    if all_stats:
+        print("\n" + "=" * 60)
+        print(f"Aggregate Speed Metrics ({len(all_stats)} generations)")
+        print("=" * 60)
+
+        # Autoregressive stats (always present)
+        ar_stats_list = [s['autoregressive'] for s in all_stats if 'autoregressive' in s]
+        if ar_stats_list:
+            ar_total_tokens = sum(s['total_tokens'] for s in ar_stats_list)
+            ar_total_time = sum(s['total_time'] for s in ar_stats_list)
+            ar_tok_s = ar_total_tokens / ar_total_time if ar_total_time > 0 else 0
+            print(f"[Autoregressive]")
+            print(f"  Total tokens:    {ar_total_tokens}")
+            print(f"  Total time:      {ar_total_time:.2f}s")
+            print(f"  Tokens/sec:      {ar_tok_s:.1f}")
+
+        # Speculative stats
+        spec_stats_list = [s['speculative'] for s in all_stats if 'speculative' in s]
+        if spec_stats_list:
+            spec_total_tokens = sum(s['total_tokens'] for s in spec_stats_list)
+            spec_total_time = sum(s['total_time'] for s in spec_stats_list)
+            spec_tok_s = spec_total_tokens / spec_total_time if spec_total_time > 0 else 0
+            accept_lengths = []
+            total_decode_time = 0
+            for s in spec_stats_list:
+                accept_lengths.extend(s.get('accept_lengths', []))
+                total_decode_time += s.get('decode_time', 0)
+            decode_tok_s = spec_total_tokens / total_decode_time if total_decode_time > 0 else 0
+            avg_accept = sum(accept_lengths) / len(accept_lengths) if accept_lengths else 0
+
+            print(f"[Speculative Decoding]")
+            print(f"  Total tokens:    {spec_total_tokens}")
+            print(f"  Total time:      {spec_total_time:.2f}s")
+            print(f"  Tokens/sec:      {spec_tok_s:.1f}")
+            print(f"  Decode tok/s:    {decode_tok_s:.1f}")
+            print(f"  Avg accept len:  {avg_accept:.2f}")
+            print(f"  Total rounds:    {sum(s['total_rounds'] for s in spec_stats_list)}")
+
+        # Comparison (when both are available)
+        if ar_stats_list and spec_stats_list:
+            speedup_ratios = [s['speedup_ratio'] for s in all_stats if 'speedup_ratio' in s]
+            matches = [s['output_match'] for s in all_stats if 'output_match' in s]
+            avg_speedup = sum(speedup_ratios) / len(speedup_ratios) if speedup_ratios else 0
+            match_rate = sum(matches) / len(matches) if matches else 0
+            overall_speedup = ar_total_time / spec_total_time if spec_total_time > 0 else 0
+
+            print(f"[Comparison]")
+            print(f"  Overall speedup:      {overall_speedup:.2f}x")
+            print(f"  Avg per-turn speedup: {avg_speedup:.2f}x")
+            print(f"  Output match rate:    {match_rate:.1%} ({sum(matches)}/{len(matches)})")
+            if match_rate < 1.0:
+                num_mismatch = len(matches) - sum(matches)
+                print(f"  WARNING: {num_mismatch} output(s) differ between AR and speculative!")
+        print("=" * 60)
 
 
 if __name__ == '__main__':
+    all_stats = []
     main()

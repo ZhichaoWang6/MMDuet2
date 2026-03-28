@@ -18,6 +18,7 @@ python -u inference.py \
     --test_fname ./data/annotations/${dataset}-frame_input_format.json \
     --output_fname ${output_dir}/pred.jsonl \
     --use_speculative_decoding true \
+    --compare_with_baseline true \
     --adapter_path $ADAPTER_PATH \
     --exit_layer 2 \
     --speculative_threshold 0.6 \

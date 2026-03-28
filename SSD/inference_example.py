@@ -1,5 +1,6 @@
 """
 Example inference script for Kangaroo self-speculative decoding.
+Runs both speculative and autoregressive decoding, compares outputs and speed.
 
 Usage:
     python inference_example.py \
@@ -9,6 +10,7 @@ Usage:
 """
 
 import argparse
+import time
 import torch
 from transformers import AutoProcessor
 
@@ -43,8 +45,8 @@ def main():
     text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
     inputs = processor(text=[text], return_tensors="pt").to(device)
 
-    # Run speculative decoding
-    print(f"Generating with speculative decoding (exit_layer={args.exit_layer}, "
+    # ========== 1. Run speculative decoding ==========
+    print(f"\nGenerating with speculative decoding (exit_layer={args.exit_layer}, "
           f"steps={args.speculative_steps}, threshold={args.threshold})...")
 
     output_ids, _, stats = kangaroo_speculative_generate(
@@ -57,27 +59,72 @@ def main():
         threshold=args.threshold,
     )
 
-    # Decode output
-    new_tokens = output_ids[:, inputs['input_ids'].shape[1]:]
-    reply = processor.batch_decode(new_tokens, skip_special_tokens=True)[0]
+    # Decode speculative output
+    spec_new_tokens = output_ids[:, inputs['input_ids'].shape[1]:]
+    spec_reply = processor.batch_decode(spec_new_tokens, skip_special_tokens=True)[0]
+    spec_num_tokens = spec_new_tokens.shape[1]
 
-    # Print results
+    # ========== 2. Run autoregressive baseline ==========
+    print("Generating with autoregressive decoding (baseline)...")
+
+    # Reset model state for clean AR run
+    model.base_model.past_key_values = None
+
+    torch.cuda.synchronize() if torch.cuda.is_available() else None
+    t_start = time.perf_counter()
+
+    ar_output = model.base_model.model.generate(
+        **inputs,
+        max_new_tokens=args.max_new_tokens,
+        return_dict_in_generate=True,
+        do_sample=False,
+    )
+
+    torch.cuda.synchronize() if torch.cuda.is_available() else None
+    ar_time = time.perf_counter() - t_start
+
+    ar_token_ids = ar_output.sequences[:, inputs['input_ids'].shape[1]:]
+    ar_num_tokens = ar_token_ids.shape[1]
+    ar_reply = processor.batch_decode(ar_token_ids, skip_special_tokens=True)[0]
+
+    # ========== 3. Compare and print results ==========
+    output_match = (spec_reply == ar_reply)
+    length_match = (spec_num_tokens == ar_num_tokens)
+    speedup = ar_time / stats['total_time'] if stats['total_time'] > 0 else 0
+
     print("\n" + "=" * 60)
     print(f"Prompt: {args.prompt}")
-    print(f"Reply: {reply}")
     print("=" * 60)
-    print(f"Metrics:")
-    print(f"  Total tokens:          {stats['total_tokens']}")
-    print(f"  Total time:            {stats['total_time']:.3f}s")
-    print(f"  Prefill time:          {stats['prefill_time']:.3f}s")
-    print(f"  Decode time:           {stats['decode_time']:.3f}s")
-    print(f"  Tokens/sec (total):    {stats['tokens_per_second']:.1f}")
-    print(f"  Tokens/sec (decode):   {stats['decode_tokens_per_second']:.1f}")
-    print(f"  Avg accept length:     {stats['avg_accept_length']:.2f}")
-    print(f"  Total rounds:          {stats['total_rounds']}")
-    print(f"  Avg draft time:        {stats['avg_draft_time']*1000:.1f}ms")
-    print(f"  Avg verify time:       {stats['avg_verify_time']*1000:.1f}ms")
-    print(f"  Accept lengths:        {stats['accept_lengths']}")
+
+    print(f"\n[Speculative Decoding]")
+    print(f"  Reply:  {spec_reply}")
+    print(f"  Tokens: {spec_num_tokens}")
+    print(f"  Time:   {stats['total_time']:.3f}s (prefill={stats['prefill_time']:.3f}s, decode={stats['decode_time']:.3f}s)")
+    print(f"  Tok/s:  {stats['tokens_per_second']:.1f} (decode: {stats['decode_tokens_per_second']:.1f})")
+    print(f"  Avg accept length: {stats['avg_accept_length']:.2f}")
+    print(f"  Total rounds:      {stats['total_rounds']}")
+    print(f"  Avg draft time:    {stats['avg_draft_time']*1000:.1f}ms")
+    print(f"  Avg verify time:   {stats['avg_verify_time']*1000:.1f}ms")
+    print(f"  Accept lengths:    {stats['accept_lengths']}")
+
+    ar_tok_s = ar_num_tokens / ar_time if ar_time > 0 else 0
+    print(f"\n[Autoregressive Baseline]")
+    print(f"  Reply:  {ar_reply}")
+    print(f"  Tokens: {ar_num_tokens}")
+    print(f"  Time:   {ar_time:.3f}s")
+    print(f"  Tok/s:  {ar_tok_s:.1f}")
+
+    print(f"\n[Comparison]")
+    print(f"  Speedup:       {speedup:.2f}x")
+    tag = "MATCH" if output_match else "MISMATCH"
+    print(f"  Output text:   {tag}")
+    tag = "MATCH" if length_match else "MISMATCH"
+    print(f"  Output length: {tag} (spec={spec_num_tokens}, ar={ar_num_tokens})")
+    if not output_match:
+        print(f"  WARNING: Outputs differ! Greedy decoding should produce identical results.")
+        print(f"    Spec: {repr(spec_reply[:300])}")
+        print(f"    AR:   {repr(ar_reply[:300])}")
+    print("=" * 60)
 
 
 if __name__ == '__main__':

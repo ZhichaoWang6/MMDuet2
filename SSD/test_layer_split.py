@@ -1,11 +1,9 @@
 """
-Minimal test to verify that splitting model layers produces identical results.
-
-Tests:
-1. Full model forward → logits vs split (early layers → verify layers) → logits
-2. Single token decode: full model vs split forward
+Minimal test: compare full-layers token-by-token decode vs split-layers decode.
+No generate() involved - both paths use identical prefill and manual decode loop.
 """
 
+import copy
 import torch
 from transformers import AutoProcessor
 from transformers.cache_utils import DynamicCache
@@ -13,7 +11,7 @@ from transformers.cache_utils import DynamicCache
 from kangaroo_model import KangarooQwenModel
 
 
-def test_layer_split(model_path='Qwen/Qwen2.5-VL-3B-Instruct', exit_layer=2):
+def test_split_decode(model_path='Qwen/Qwen2.5-VL-3B-Instruct', exit_layer=2, num_tokens=10):
     print(f"Loading model from {model_path}, exit_layer={exit_layer}...")
     model = KangarooQwenModel(
         base_model_path=model_path,
@@ -28,20 +26,18 @@ def test_layer_split(model_path='Qwen/Qwen2.5-VL-3B-Instruct', exit_layer=2):
     full_model = base_model.model  # Qwen2_5_VLForConditionalGeneration
     qwen_model = full_model.model  # Qwen2_5_VLModel
     lm_head = model.head_model
+    num_layers = len(qwen_model.layers)
 
     # Build input
     prompt = "Hello, what can you do?"
     messages = [{"role": "user", "content": [{"type": "text", "text": prompt}]}]
     text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
     inputs = processor(text=[text], return_tensors="pt").to(device)
+    context_len = inputs['input_ids'].shape[1]
+    print(f"Input tokens: {context_len}, num_layers: {num_layers}")
 
-    print(f"\nInput shape: {inputs['input_ids'].shape}")
-
-    # ===== TEST 1: Prefill - full forward vs split =====
-    print("\n" + "=" * 60)
-    print("TEST 1: Prefill - compare full forward with hidden_states split")
-    print("=" * 60)
-
+    # ========== SHARED PREFILL ==========
+    print("\n[Prefill]")
     with torch.no_grad():
         output = full_model(
             **{k: v for k, v in inputs.items() if v is not None},
@@ -51,116 +47,149 @@ def test_layer_split(model_path='Qwen/Qwen2.5-VL-3B-Instruct', exit_layer=2):
             drop_method='none', drop_threshold=1.0, drop_absolute=True,
         )
 
-    # Method A: full model logits (from CausalLM wrapper)
-    full_logits = output.logits[:, -1, :]
-    full_token = torch.argmax(full_logits, dim=-1)
-
-    # Method B: hidden_states[-1] (after norm) → lm_head
-    hs_last = output.hidden_states[-1][:, -1:, :]
-    manual_logits = lm_head(hs_last).squeeze(1)
-    manual_token = torch.argmax(manual_logits, dim=-1)
-
-    # Method C: hidden_states[exit_layer] → verify layers → norm → lm_head
-    hs_early = output.hidden_states[exit_layer][:, -1:, :]  # 1 token at last position
-    # Run through remaining layers manually
-    past_kv = output.past_key_values
-    context_len = inputs['input_ids'].shape[1]
-    cache_pos = torch.tensor([context_len - 1], device=device)
+    first_token = torch.argmax(output.logits[:, -1, :], dim=-1).item()
     rope_deltas = full_model.rope_deltas
-    if rope_deltas is not None:
-        delta = (cache_pos[0] + rope_deltas).to(device)
-    else:
-        delta = cache_pos[0]
-    pos_ids = torch.tensor([[0]], device=device) + delta
-    pos_ids = pos_ids.unsqueeze(0).expand(3, -1, -1)
-    pe = qwen_model.rotary_emb(hs_early, pos_ids)
-    attn_mask = torch.ones((1, context_len), dtype=torch.bool, device=device)
-    causal_mask = qwen_model._update_causal_mask(attn_mask, hs_early, cache_pos, past_kv, False)
+    print(f"  First token: {first_token} = '{processor.decode([first_token])}'")
+    print(f"  rope_deltas: {rope_deltas}")
 
-    h = hs_early
-    for layer in qwen_model.layers[exit_layer:]:
-        layer_out = layer(h, attention_mask=causal_mask, position_ids=pos_ids,
-                          past_key_value=past_kv, output_attentions=False,
-                          use_cache=False, cache_position=cache_pos,
-                          position_embeddings=pe)
-        h = layer_out[0]
-    h_normed = qwen_model.norm(h)
-    split_logits = lm_head(h_normed).squeeze(1)
-    split_token = torch.argmax(split_logits, dim=-1)
-
-    logit_diff_AB = (full_logits.float() - manual_logits.float()).abs().max().item()
-    logit_diff_AC = (full_logits.float() - split_logits.float()).abs().max().item()
-    logit_diff_BC = (manual_logits.float() - split_logits.float()).abs().max().item()
-
-    print(f"  Full model token:    {full_token.item()} = '{processor.decode([full_token.item()])}'")
-    print(f"  HS[-1]+lm_head token:{manual_token.item()} = '{processor.decode([manual_token.item()])}'")
-    print(f"  Split layers token:  {split_token.item()} = '{processor.decode([split_token.item()])}'")
-    print(f"  Logit max diff (full vs hs[-1]):  {logit_diff_AB}")
-    print(f"  Logit max diff (full vs split):   {logit_diff_AC}")
-    print(f"  Logit max diff (hs[-1] vs split): {logit_diff_BC}")
-    print(f"  Token A==B: {full_token.item() == manual_token.item()}, "
-          f"A==C: {full_token.item() == split_token.item()}, "
-          f"B==C: {manual_token.item() == split_token.item()}")
-
-    # ===== TEST 2: Decode step - full model generate 1 token vs earlyexit split =====
-    print("\n" + "=" * 60)
-    print("TEST 2: Decode - compare full model next token vs earlyexit split")
-    print("=" * 60)
-
-    # Path A: Use generate() for 1 token
-    full_model.rope_deltas = None  # reset for clean generate
-    with torch.no_grad():
-        gen_output = full_model.generate(
-            **{k: v for k, v in inputs.items() if v is not None},
-            max_new_tokens=5,
-            return_dict_in_generate=True,
-            do_sample=False,
-            drop_method='none', drop_threshold=1.0, drop_absolute=True,
+    # Deep copy KV cache so both paths start from identical state
+    prefill_cache = output.past_key_values
+    cache_A = DynamicCache()  # Path A: full layers
+    cache_B = DynamicCache()  # Path B: split layers
+    for layer_idx in range(num_layers):
+        cache_A.update(
+            prefill_cache.key_cache[layer_idx].clone(),
+            prefill_cache.value_cache[layer_idx].clone(),
+            layer_idx,
         )
-    ar_tokens = gen_output.sequences[0, inputs['input_ids'].shape[1]:].tolist()
-    ar_text = processor.decode(ar_tokens, skip_special_tokens=True)
-    print(f"  AR generate (5 tokens): {ar_tokens} = '{ar_text}'")
-
-    # Path B: Use earlyexit split for the same tokens
-    # Re-do prefill with a fresh cache
-    base_model.past_key_values = None
-    with torch.no_grad():
-        output2 = full_model(
-            **{k: v for k, v in inputs.items() if v is not None},
-            use_cache=True,
-            output_hidden_states=True,
-            return_dict=True,
-            drop_method='none', drop_threshold=1.0, drop_absolute=True,
+        cache_B.update(
+            prefill_cache.key_cache[layer_idx].clone(),
+            prefill_cache.value_cache[layer_idx].clone(),
+            layer_idx,
         )
-    base_model.past_key_values = output2.past_key_values
+    # Fix _seen_tokens (each update at layer 0 increments it, but we only want context_len)
+    cache_A._seen_tokens = context_len
+    cache_B._seen_tokens = context_len
 
-    first_token_B = torch.argmax(lm_head(output2.hidden_states[-1][:, -1:, :]), dim=-1).item()
-    print(f"  Split prefill first token: {first_token_B} = '{processor.decode([first_token_B])}'")
-    print(f"  AR first token:            {ar_tokens[0]} = '{processor.decode([ar_tokens[0]])}'")
-    print(f"  First token match: {first_token_B == ar_tokens[0]}")
+    print(f"  cache_A._seen_tokens: {cache_A._seen_tokens}, cache_B._seen_tokens: {cache_B._seen_tokens}")
+    print(f"  cache_A layer 0 shape: {cache_A.key_cache[0].shape}, layer {exit_layer} shape: {cache_A.key_cache[exit_layer].shape}")
 
-    # Now decode token by token using earlyexit
-    split_tokens = [first_token_B]
-    for step in range(4):
-        in_token = torch.tensor([[split_tokens[-1]]], device=device)
-        # Draft: layers 0 to exit_layer-1
-        draft_h = base_model.forward_draft_or_large_model(in_tokens_small=in_token)
-        # Verify: layers exit_layer to end
-        _, verify_h_normed = base_model.forward_draft_or_large_model(in_features_large=draft_h)
-        token_logits = lm_head(verify_h_normed[:, -1:, :]).float()
-        next_token = torch.argmax(token_logits, dim=-1).item()
-        split_tokens.append(next_token)
-        print(f"  Step {step+1}: split_token={next_token}('{processor.decode([next_token])}'), "
-              f"ar_token={ar_tokens[step+1] if step+1 < len(ar_tokens) else 'N/A'}"
-              f"('{processor.decode([ar_tokens[step+1]])}' if step+1 < len(ar_tokens) else ''), "
-              f"match={next_token == ar_tokens[step+1] if step+1 < len(ar_tokens) else 'N/A'}")
+    # Verify caches are identical
+    for li in range(num_layers):
+        diff = (cache_A.key_cache[li] - cache_B.key_cache[li]).abs().max().item()
+        if diff > 0:
+            print(f"  WARNING: cache diff at layer {li}: {diff}")
 
-    split_text = processor.decode(split_tokens, skip_special_tokens=True)
-    print(f"\n  AR tokens:    {ar_tokens}")
-    print(f"  Split tokens: {split_tokens}")
-    print(f"  AR text:    '{ar_text}'")
-    print(f"  Split text: '{split_text}'")
-    print(f"  Match: {ar_tokens[:len(split_tokens)] == split_tokens}")
+    # ========== DECODE: Path A (full layers) vs Path B (split layers) ==========
+    print(f"\n[Decode {num_tokens} tokens]")
+    tokens_A = [first_token]
+    tokens_B = [first_token]
+
+    for step in range(num_tokens):
+        pos = context_len + step  # position of previous token (what we're processing)
+
+        # ----- Path A: Full model, all layers -----
+        in_A = torch.tensor([[tokens_A[-1]]], device=device)
+        cache_pos_A = torch.tensor([pos], device=device)
+        if rope_deltas is not None:
+            delta_A = (pos + rope_deltas).to(device)
+        else:
+            delta_A = pos
+        pos_ids_A = (torch.zeros(1, 1, device=device, dtype=torch.long) + delta_A).unsqueeze(0).expand(3, -1, -1)
+
+        with torch.no_grad():
+            h_A = qwen_model.embed_tokens(in_A)
+            pe_A = qwen_model.rotary_emb(h_A, pos_ids_A)
+            attn_A = torch.ones((1, pos + 1), dtype=torch.bool, device=device)
+            cm_A = qwen_model._update_causal_mask(attn_A, h_A, cache_pos_A, cache_A, False)
+            for layer in qwen_model.layers:
+                lo = layer(h_A, attention_mask=cm_A, position_ids=pos_ids_A,
+                           past_key_value=cache_A, output_attentions=False,
+                           use_cache=True, cache_position=cache_pos_A,
+                           position_embeddings=pe_A)
+                h_A = lo[0]
+            h_A_normed = qwen_model.norm(h_A)
+            logits_A = lm_head(h_A_normed).float().squeeze(0).squeeze(0)
+            next_A = torch.argmax(logits_A).item()
+        tokens_A.append(next_A)
+
+        # ----- Path B: Split layers (draft + verify) -----
+        in_B = torch.tensor([[tokens_B[-1]]], device=device)
+
+        with torch.no_grad():
+            # Draft: layers 0 to exit_layer-1
+            cache_pos_draft = torch.tensor([cache_B.key_cache[0].shape[2]], device=device)
+            if rope_deltas is not None:
+                delta_B_draft = (cache_pos_draft[0].item() + rope_deltas).to(device)
+            else:
+                delta_B_draft = cache_pos_draft[0].item()
+            pos_ids_draft = (torch.zeros(1, 1, device=device, dtype=torch.long) + delta_B_draft).unsqueeze(0).expand(3, -1, -1)
+            h_B = qwen_model.embed_tokens(in_B)
+            pe_draft = qwen_model.rotary_emb(h_B, pos_ids_draft)
+            attn_draft = torch.ones((1, cache_pos_draft[-1].item() + 1), dtype=torch.bool, device=device)
+            cm_draft = qwen_model._update_causal_mask(attn_draft, h_B, cache_pos_draft, cache_B, False)
+            for layer in qwen_model.layers[:exit_layer]:
+                lo = layer(h_B, attention_mask=cm_draft, position_ids=pos_ids_draft,
+                           past_key_value=cache_B, output_attentions=False,
+                           use_cache=True, cache_position=cache_pos_draft,
+                           position_embeddings=pe_draft)
+                h_B = lo[0]
+            draft_h = h_B
+
+            # Verify: layers exit_layer to end
+            cache_pos_verify = torch.tensor([cache_B.key_cache[exit_layer].shape[2]], device=device)
+            if rope_deltas is not None:
+                delta_B_verify = (cache_pos_verify[0].item() + rope_deltas).to(device)
+            else:
+                delta_B_verify = cache_pos_verify[0].item()
+            pos_ids_verify = (torch.zeros(1, 1, device=device, dtype=torch.long) + delta_B_verify).unsqueeze(0).expand(3, -1, -1)
+            pe_verify = qwen_model.rotary_emb(draft_h, pos_ids_verify)
+            attn_verify = torch.ones((1, cache_pos_verify[-1].item() + 1), dtype=torch.bool, device=device)
+            cm_verify = qwen_model._update_causal_mask(attn_verify, draft_h, cache_pos_verify, cache_B, False)
+            for layer in qwen_model.layers[exit_layer:]:
+                lo = layer(draft_h, attention_mask=cm_verify, position_ids=pos_ids_verify,
+                           past_key_value=cache_B, output_attentions=False,
+                           use_cache=True, cache_position=cache_pos_verify,
+                           position_embeddings=pe_verify)
+                draft_h = lo[0]
+            h_B_normed = qwen_model.norm(draft_h)
+            logits_B = lm_head(h_B_normed).float().squeeze(0).squeeze(0)
+            next_B = torch.argmax(logits_B).item()
+        tokens_B.append(next_B)
+
+        # Compare
+        match = next_A == next_B
+        logit_diff = (logits_A - logits_B).abs().max().item()
+        logit_A_top = torch.topk(logits_A, 3)
+        logit_B_top = torch.topk(logits_B, 3)
+
+        # Check cache alignment
+        ca_len = cache_A.key_cache[0].shape[2]
+        cb0_len = cache_B.key_cache[0].shape[2]
+        cb_ex_len = cache_B.key_cache[exit_layer].shape[2]
+
+        tag = "OK" if match else "MISMATCH"
+        print(f"  Step {step+1}: [{tag}] "
+              f"A={next_A}('{processor.decode([next_A])}') "
+              f"B={next_B}('{processor.decode([next_B])}') "
+              f"logit_diff={logit_diff:.4f} "
+              f"cache_A={ca_len} cache_B_L0={cb0_len} cache_B_L{exit_layer}={cb_ex_len}")
+        if not match:
+            print(f"    A_top3: tokens={logit_A_top.indices.tolist()}, vals={logit_A_top.values.tolist()}")
+            print(f"    B_top3: tokens={logit_B_top.indices.tolist()}, vals={logit_B_values.tolist()}")
+
+            # Check KV cache divergence
+            for li in [0, 1, exit_layer, exit_layer+1, num_layers-1]:
+                if li < num_layers:
+                    kd = (cache_A.key_cache[li] - cache_B.key_cache[li]).abs().max().item()
+                    vd = (cache_A.value_cache[li] - cache_B.value_cache[li]).abs().max().item()
+                    print(f"    Cache diff layer {li}: key={kd:.6f}, val={vd:.6f}")
+
+    text_A = processor.decode(tokens_A, skip_special_tokens=True)
+    text_B = processor.decode(tokens_B, skip_special_tokens=True)
+    print(f"\n  Path A (full):  '{text_A}'")
+    print(f"  Path B (split): '{text_B}'")
+    print(f"  Match: {tokens_A == tokens_B}")
 
 
 if __name__ == '__main__':
@@ -168,5 +197,6 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--model_path', type=str, default='Qwen/Qwen2.5-VL-3B-Instruct')
     parser.add_argument('--exit_layer', type=int, default=2)
+    parser.add_argument('--num_tokens', type=int, default=10)
     args = parser.parse_args()
-    test_layer_split(args.model_path, args.exit_layer)
+    test_split_decode(args.model_path, args.exit_layer, args.num_tokens)

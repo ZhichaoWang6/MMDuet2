@@ -3,7 +3,7 @@
 # This collects hidden states from the full model on MMDuet2 multimodal data.
 
 MODEL_PATH=Qwen/Qwen2.5-VL-3B-Instruct  # or your fine-tuned checkpoint
-DATA_PATH=./data/annotations/ego-frame_input_format.json  # modify to your data path
+DATA_PATH=./data/annotations/ego-frame_input_format.json
 OUTPUT_DIR=./training_data/
 EXIT_LAYERS=2,3  # Save hidden states for both layer 2 and 3
 

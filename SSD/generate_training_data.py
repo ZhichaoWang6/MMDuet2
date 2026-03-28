@@ -11,8 +11,8 @@ For each sample, saves:
 Usage:
     python generate_training_data.py \
         --model_path Qwen/Qwen2.5-VL-3B-Instruct \
-        --data_path ./proactive_eval/data/annotations/ego-frame_input_format.json \
-        --output_dir ./kangaroo/training_data/ \
+        --data_path ./data/annotations/ego-frame_input_format.json \
+        --output_dir ./training_data/ \
         --exit_layers 2,3 \
         --start 0 --end 100
 """

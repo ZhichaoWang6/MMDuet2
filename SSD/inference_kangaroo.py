@@ -54,6 +54,7 @@ def kangaroo_speculative_generate(
     threshold: float = 0.6,
     do_sample: bool = False,
     past_key_values=None,  # existing KV cache from previous turns (streaming)
+    debug_verify: bool = False,  # Run full-model verification alongside split draft-verify
 ):
     """
     Speculative decoding generation for Qwen2.5-VL.
@@ -141,6 +142,16 @@ def kangaroo_speculative_generate(
     logits = head_model(hidden_state)
     first_token = torch.argmax(logits[:, -1, :], dim=-1)
     global_tokens[:, start_index] = first_token.item()
+
+    if debug_verify:
+        # Compare our first token with the model's own logits
+        model_logits = output.logits
+        model_first_token = torch.argmax(model_logits[:, -1, :], dim=-1)
+        print(f"[DEBUG] Prefill first token: ours={first_token.item()}, model={model_first_token.item()}, "
+              f"match={first_token.item() == model_first_token.item()}")
+        # Check hidden_states[-1] == last_hidden_state
+        lhs_diff = (output.hidden_states[-1][:, -1, :] - output.hidden_states[-1][:, -1, :]).abs().max().item()
+        print(f"[DEBUG] hidden_states[-1] self-diff: {lhs_diff}")
 
     # Get early exit hidden state for adapter initialization
     hidden_state_early = output.hidden_states[early_exit_layer]
@@ -246,6 +257,16 @@ def kangaroo_speculative_generate(
 
         logits = head_model(hidden_state_normed).float()
         output_tokens = torch.argmax(logits, dim=-1)
+
+        if debug_verify and len(accept_length_list) <= 5:
+            round_num = len(accept_length_list)
+            print(f"[DEBUG] Round {round_num}: start_index={start_index_copy}, end_index={end_index}, "
+                  f"output_length={end_index - start_index_copy}, "
+                  f"draft_L0_cache={base_model._get_layer_cache_length(0)}, "
+                  f"verify_L{early_exit_layer}_cache={base_model._get_layer_cache_length(early_exit_layer)}, "
+                  f"_seen_tokens={base_model.past_key_values._seen_tokens}, "
+                  f"verify_token='{tokenizer.decode([output_tokens[0, 0].item()])}'({output_tokens[0, 0].item()}), "
+                  f"logits_top3={torch.topk(logits[0, 0], 3).indices.tolist()}")
 
         # ---- STEP 3: Accept verified tokens ----
         output_length = end_index - start_index

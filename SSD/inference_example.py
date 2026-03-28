@@ -57,6 +57,7 @@ def main():
         early_exit_layer=args.exit_layer,
         speculative_steps=args.speculative_steps,
         threshold=args.threshold,
+        debug_verify=True,
     )
 
     # Decode speculative output
@@ -69,6 +70,8 @@ def main():
 
     # Reset model state for clean AR run
     model.base_model.past_key_values = None
+    model.reset_status()
+    model.base_model.model.rope_deltas = None  # force recompute
 
     torch.cuda.synchronize() if torch.cuda.is_available() else None
     t_start = time.perf_counter()
@@ -78,6 +81,7 @@ def main():
         max_new_tokens=args.max_new_tokens,
         return_dict_in_generate=True,
         do_sample=False,
+        drop_method='none', drop_threshold=1.0, drop_absolute=True,
     )
 
     torch.cuda.synchronize() if torch.cuda.is_available() else None
